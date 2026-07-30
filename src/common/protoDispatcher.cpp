@@ -41,6 +41,56 @@
 #include <stdio.h>
 #include <string.h>
 
+// ─── FermiHDI netcore backend (additive) ───────────────────────────────
+// Companion to protoSocket.cpp's PROTOSOCKET_NETCORE_BACKEND block: once
+// ProtoSocket's handles are F-Stack descriptors, the readiness pump that
+// waits on them (this file's USE_EPOLL branch: EpollChange()/Wait()'s
+// epoll_create1()/epoll_ctl()/epoll_wait() calls) must use F-Stack's own
+// ff_epoll_* equivalents (lib/ff_epoll.h) -- the kernel's real epoll
+// instance has never heard of an F-Stack fd. Requires USE_EPOLL (not
+// USE_SELECT/USE_KQUEUE) and, importantly, requires USE_TIMERFD to be
+// OFF for this build: with USE_TIMERFD, Wait() adds a kernel timerfd
+// descriptor into the SAME epoll set as the sockets so one wait call
+// covers both -- but a kernel timerfd cannot be added to an F-Stack
+// epoll instance (disjoint descriptor spaces), so the netcore build
+// (protolib/CMakeLists.txt's PROTOKIT_NETCORE_BACKEND option) omits
+// USE_TIMERFD, falling back to this file's plain "convert timerDelay to
+// an epoll_wait() millisecond timeout" path -- already present in the
+// unmodified code below (the `#ifdef USE_TIMERFD` branches simply don't
+// trigger), so no additional restructuring was needed here beyond the
+// syscall/errno redirection.
+//
+// Known, Tier-B-only risk (undetermined without live F-Stack/DPDK
+// hardware, not available in this environment -- see design-notes.md's
+// tooling survey): ProtoDispatcher's threaded mode (StartThread()) also
+// adds a real kernel descriptor (break_event, an eventfd/pipe used to
+// wake a blocked dispatcher thread) into this same epoll set via
+// EpollChange(). Whether F-Stack's ff_epoll_ctl() accepts a foreign
+// (non-F-Stack) kernel fd as a member is unverified here. If
+// NormBackend's actual usage never invokes ProtoDispatcher's threaded
+// mode (plausible, since it drives NORM's public C API -- normApi.h's
+// polling-style NormGetNextEvent() -- rather than necessarily
+// StartThread()), this risk doesn't apply; flagged rather than silently
+// assumed away.
+#if defined(UNIX) && defined(PROTOSOCKET_NETCORE_BACKEND) && defined(USE_EPOLL)
+#include <ff_epoll.h>
+#include <ff_errno.h>
+
+namespace {
+    inline int netcore_epoll_create1(int /*flags*/) { return ff_epoll_create(0); }
+    inline int netcore_epoll_ctl(int epfd, int op, int fd, struct epoll_event* event)
+        { return ff_epoll_ctl(epfd, op, fd, event); }
+    inline int netcore_epoll_wait(int epfd, struct epoll_event* events, int maxevents, int timeout)
+        { return ff_epoll_wait(epfd, events, maxevents, timeout); }
+}  // namespace
+
+#define epoll_create1 netcore_epoll_create1
+#define epoll_ctl     netcore_epoll_ctl
+#define epoll_wait    netcore_epoll_wait
+#undef EINTR
+#define EINTR         ff_EINTR
+#endif // UNIX && PROTOSOCKET_NETCORE_BACKEND && USE_EPOLL
+
 #ifdef WIN32
 #include <TCHAR.h>
 #ifndef _WIN32_WCE

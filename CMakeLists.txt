@@ -14,6 +14,23 @@ option(PROTOKIT_ENABLE_DEBUG "Include debugging messages/logging **NOT IMPLEMENT
 option(PROTOKIT_ENABLE_WX "Enables building with WX Widgets" OFF)
 option(PROTOKIT_ENABLE_INSTALL "Enables install target" OFF)
 
+# FermiHDI addition: builds protoSocket.cpp/protoDispatcher.cpp's
+# PROTOSOCKET_NETCORE_BACKEND branch (see those files' file comments),
+# routing ProtoSocket I/O and ProtoDispatcher's epoll-based readiness
+# pump through F-Stack's DPDK user-space TCP/IP stack (lib/ff_api.h,
+# lib/ff_epoll.h) instead of kernel sockets/epoll. Requires
+# PROTOKIT_NETCORE_FSTACK_ROOT to point at a built F-Stack checkout
+# (submodules/f-stack in libfermihdi_netcore) -- see that project's
+# CMakeLists.txt for how F-Stack's own lib/Makefile gets invoked.
+# Produces a build-time-distinct library: this is NOT a runtime switch
+# (matches the "additive, build-time-selected" design in
+# libfermihdi_netcore/docs/design-notes.md §2.1/§5a).
+option(PROTOKIT_NETCORE_BACKEND "Build protokit's F-Stack-backed ProtoSocket/ProtoDispatcher variant instead of the kernel-socket one" OFF)
+set(PROTOKIT_NETCORE_FSTACK_ROOT "" CACHE PATH "Path to a built F-Stack checkout's lib/ directory (required if PROTOKIT_NETCORE_BACKEND is ON)")
+if(PROTOKIT_NETCORE_BACKEND AND "${PROTOKIT_NETCORE_FSTACK_ROOT}" STREQUAL "")
+    message(FATAL_ERROR "PROTOKIT_NETCORE_BACKEND requires PROTOKIT_NETCORE_FSTACK_ROOT to be set")
+endif()
+
 # Availability checks
 include(CheckCXXSymbolExists)
 include(CheckStructHasMember)
@@ -22,8 +39,10 @@ include(CheckIncludeFiles)
 include(CheckLibraryExists)
 
 check_include_files( sys/timerfd.h HAVE_TIMERFD_H)
-if(HAVE_TIMERFD_H)
+if(HAVE_TIMERFD_H AND NOT PROTOKIT_NETCORE_BACKEND)
 	list(APPEND PLATFORM_DEFINITIONS USE_TIMERFD)
+elseif(PROTOKIT_NETCORE_BACKEND)
+	message(STATUS "PROTOKIT_NETCORE_BACKEND is ON -- omitting USE_TIMERFD (a kernel timerfd can't join an F-Stack epoll set; see protoDispatcher.cpp's netcore-backend comment)")
 endif()
 
 check_include_files( sys/select.h HAVE_SELECT_H)
@@ -266,6 +285,12 @@ target_compile_definitions(protokit PUBLIC ${PLATFORM_DEFINITIONS})
 target_compile_options(protokit PUBLIC ${PLATFORM_FLAGS})
 target_include_directories(protokit PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(protokit PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+
+if(PROTOKIT_NETCORE_BACKEND)
+	target_compile_definitions(protokit PUBLIC PROTOSOCKET_NETCORE_BACKEND)
+	target_include_directories(protokit PRIVATE ${PROTOKIT_NETCORE_FSTACK_ROOT})
+	target_link_libraries(protokit PRIVATE ${PROTOKIT_NETCORE_FSTACK_ROOT}/libfstack.a)
+endif()
 
 # Install target
 if(${PROTOKIT_ENABLE_INSTALL})

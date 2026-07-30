@@ -86,6 +86,134 @@ extern int netsec_requestlen;
 
 #include "protoDispatcher.h"
 
+// ─── FermiHDI netcore backend (additive; upstream file otherwise
+//     unmodified below this block) ───────────────────────────────────────
+//
+// This file's UNIX branch (below) uses raw kernel socket syscalls
+// (socket/bind/connect/close/send.../recv.../setsockopt/getsockopt/
+// getsockname/fcntl/shutdown/listen/accept) directly on ProtoSocket::
+// handle, and compares the resulting errno against plain <errno.h>
+// constants. Neither works once `handle` is an F-Stack (DPDK user-space
+// TCP/IP stack) descriptor instead of a real kernel one: F-Stack exposes
+// its own ff_-prefixed syscalls (lib/ff_api.h) with otherwise-identical
+// signatures, and reuses the process's real `errno` variable but stores
+// FreeBSD-numbered values (lib/ff_errno.h's ff_E* constants -- e.g.
+// ff_EAGAIN is 35, not Linux's 11) -- see
+// fermihdi/netcore/FStackBackend.hpp's file comment, which documents the
+// same two facts for FStackBackend itself.
+//
+// Rather than editing every one of the ~140 call sites below (touched
+// throughout Open/Bind/Connect/Close/Send/Recv/SendTo/RecvFrom/
+// JoinGroup/LeaveGroup/the Set* option methods/OnNotify's SO_ERROR
+// check), this block defines thin same-signature wrapper functions and
+// redirects the plain syscall/errno names to them via object-like/
+// function-like macros, active only when PROTOSOCKET_NETCORE_BACKEND is
+// defined (set by libfermihdi_netcore's CMake when the NORM backend is
+// configured to run over FStackBackend rather than a kernel socket).
+// This keeps the patch additive and small -- a single block, no changes
+// to the rest of this file -- so upstream merges from NRL's norm/
+// protolib stay easy, matching design-notes.md §2.1's "additive, tracked
+// against upstream via merges" principle.
+//
+// Known, deliberate gap: interface NAME resolution (GetInterfaceAddress/
+// GetInterfaceIndex, used by SetMulticastInterface/SetBindInterface/
+// JoinGroup's interface argument) still goes through the kernel's real
+// interface table (getifaddrs()/ioctl(SIOCGIFADDR), untouched below) --
+// F-Stack manages its own DPDK-bound interfaces via its own ini config,
+// invisible to the kernel's table, and exposes no ff_-prefixed
+// name-to-address lookup. Callers configuring NORM over F-Stack should
+// pass an already-resolved local address, not an interface name, for
+// SetMulticastInterface/JoinGroup's interface argument. This was
+// explicitly out of scope for this patch (design-notes.md's original
+// method list -- Open/Bind/Connect/Listen/Accept/Send/Recv/SendTo/
+// RecvFrom/Shutdown/Close -- never included interface-name resolution),
+// not an oversight.
+#if defined(UNIX) && defined(PROTOSOCKET_NETCORE_BACKEND)
+#include <ff_api.h>
+
+namespace {
+    inline int netcore_socket(int domain, int type, int protocol) { return ff_socket(domain, type, protocol); }
+    inline int netcore_bind(int s, const struct sockaddr* addr, socklen_t len)
+        { return ff_bind(s, reinterpret_cast<const linux_sockaddr*>(addr), len); }
+    inline int netcore_connect(int s, const struct sockaddr* addr, socklen_t len)
+        { return ff_connect(s, reinterpret_cast<const linux_sockaddr*>(addr), len); }
+    inline int netcore_listen(int s, int backlog) { return ff_listen(s, backlog); }
+    inline int netcore_accept(int s, struct sockaddr* addr, socklen_t* len)
+        { return ff_accept(s, reinterpret_cast<linux_sockaddr*>(addr), len); }
+    inline int netcore_getsockname(int s, struct sockaddr* addr, socklen_t* len)
+        { return ff_getsockname(s, reinterpret_cast<linux_sockaddr*>(addr), len); }
+    inline int netcore_close(int fd) { return ff_close(fd); }
+    inline int netcore_shutdown(int s, int how) { return ff_shutdown(s, how); }
+    inline ssize_t netcore_send(int s, const void* buf, size_t len, int flags)
+        { return ff_send(s, buf, len, flags); }
+    inline ssize_t netcore_sendto(int s, const void* buf, size_t len, int flags,
+                                   const struct sockaddr* addr, socklen_t addrlen)
+        { return ff_sendto(s, buf, len, flags, reinterpret_cast<const linux_sockaddr*>(addr), addrlen); }
+    inline ssize_t netcore_sendmsg(int s, const struct msghdr* msg, int flags)
+        { return ff_sendmsg(s, msg, flags); }
+    inline ssize_t netcore_recv(int s, void* buf, size_t len, int flags)
+        { return ff_recv(s, buf, len, flags); }
+    inline ssize_t netcore_recvfrom(int s, void* buf, size_t len, int flags,
+                                     struct sockaddr* addr, socklen_t* addrlen)
+        { return ff_recvfrom(s, buf, len, flags, reinterpret_cast<linux_sockaddr*>(addr), addrlen); }
+    inline ssize_t netcore_recvmsg(int s, struct msghdr* msg, int flags) { return ff_recvmsg(s, msg, flags); }
+    inline int netcore_setsockopt(int s, int level, int optname, const void* optval, socklen_t optlen)
+        { return ff_setsockopt(s, level, optname, optval, optlen); }
+    inline int netcore_getsockopt(int s, int level, int optname, void* optval, socklen_t* optlen)
+        { return ff_getsockopt(s, level, optname, optval, optlen); }
+    inline int netcore_fcntl(int fd, int cmd, int arg) { return ff_fcntl(fd, cmd, arg); }
+}  // namespace
+
+#define socket      netcore_socket
+#define bind        netcore_bind
+#define connect     netcore_connect
+#define listen      netcore_listen
+#define accept      netcore_accept
+#define getsockname netcore_getsockname
+#define close       netcore_close
+#define shutdown    netcore_shutdown
+#define send        netcore_send
+#define sendto      netcore_sendto
+#define sendmsg     netcore_sendmsg
+#define recv        netcore_recv
+#define recvfrom    netcore_recvfrom
+#define recvmsg     netcore_recvmsg
+#define setsockopt  netcore_setsockopt
+#define getsockopt  netcore_getsockopt
+#define fcntl       netcore_fcntl
+
+// errno constants: F-Stack stores FreeBSD-numbered values in the real
+// errno variable (see the file comment above) -- redirect every
+// constant this file compares errno against to its ff_-prefixed,
+// correctly-numbered equivalent (lib/ff_errno.h). Each is already
+// defined by the system <errno.h> included above, so #undef first to
+// avoid a -Wmacro-redefined warning per constant.
+#undef EAGAIN
+#undef EWOULDBLOCK
+#undef EINPROGRESS
+#undef EINTR
+#undef ENOBUFS
+#undef ECONNABORTED
+#undef ECONNRESET
+#undef ENETRESET
+#undef ENOTCONN
+#undef EPIPE
+#undef ESHUTDOWN
+#undef EAFNOSUPPORT
+#define EAGAIN        ff_EAGAIN
+#define EWOULDBLOCK   ff_EWOULDBLOCK
+#define EINPROGRESS   ff_EINPROGRESS
+#define EINTR         ff_EINTR
+#define ENOBUFS       ff_ENOBUFS
+#define ECONNABORTED  ff_ECONNABORTED
+#define ECONNRESET    ff_ECONNRESET
+#define ENETRESET     ff_ENETRESET
+#define ENOTCONN      ff_ENOTCONN
+#define EPIPE         ff_EPIPE
+#define ESHUTDOWN     ff_ESHUTDOWN
+#define EAFNOSUPPORT  ff_EAFNOSUPPORT
+#endif // UNIX && PROTOSOCKET_NETCORE_BACKEND
+
 #ifdef WIN32
 const ProtoSocket::Handle ProtoSocket::INVALID_HANDLE = INVALID_SOCKET;
 LPFN_WSARECVMSG ProtoSocket::WSARecvMsg = NULL;
@@ -2947,6 +3075,13 @@ ProtoSocket::List::Item* ProtoSocket::List::FindItem(const ProtoSocket& theSocke
     }  
     return NULL; 
 }  // end ProtoSocket::List::FindItem()
+
+#if defined(UNIX) && defined(PROTOSOCKET_NETCORE_BACKEND)
+// From here on, `socket` only ever refers to ProtoSocket::List::Item's
+// own `ProtoSocket* socket` member (never again to the syscall) --
+// undefine the netcore_socket redirect so it doesn't shadow the member.
+#undef socket
+#endif // UNIX && PROTOSOCKET_NETCORE_BACKEND
 
 ProtoSocket::List::Item::Item(ProtoSocket* theSocket)
  : socket(theSocket), prev(NULL), next(NULL)
