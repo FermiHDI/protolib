@@ -5,4 +5,10 @@
           android:versionName="1.0">
     <uses-sdk android:minSdkVersion="9"
               android:targetSdkVersion="24"/>
+    <!-- A library: no user data to back up, and this ships no cleartext HTTP
+         use, so declaring both keeps an app that merges this manifest from
+         inheriting the permissive defaults. -->
+    <application android:allowBackup="false"
+                 android:fullBackupContent="false"
+                 android:usesCleartextTraffic="false" />
 </manifest>
